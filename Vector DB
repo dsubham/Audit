@@ -1,0 +1,303 @@
+pip install python-pptx
+pip install chromadb sentence-transformers
+
+
+import google.generativeai as genai
+import os
+from PIL import Image
+import json
+import io
+
+# --- New Requirement for PPTX processing ---
+# pip install python-pptx
+
+from pptx import Presentation
+from pptx.util import Inches
+
+# --- New Requirements for Vector Database ---
+# pip install chromadb sentence-transformers
+# try: 
+import chromadb
+# Using a sentence-transformer model for creating embeddings.
+# The library will download the model automatically the first time it's used.
+from chromadb.utils import embedding_functions
+# except ImportError:
+#     print("Error: ChromaDB or sentence-transformers library not found.")
+#     print("Please install them by running: pip install chromadb sentence-transformers")
+#     exit()
+
+
+# --- Configuration ---
+# IMPORTANT: Set your API key as an environment variable for security.
+# In your terminal, run: export GOOGLE_API_KEY='YOUR_API_KEY'
+try:
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY environment variable not set.")
+    genai.configure(api_key=api_key)
+except ValueError as e:
+    print(e)
+    # Handle the error gracefully in a real application
+    exit()
+
+# --- 1. KNOWLEDGE BASE (The "source of truth" documents) ---
+KNOWLEDGE_BASE = {
+    "disclaimer_guidelines": {
+        "content": "All marketing content for 'Innovate Inc.' must include the official legal disclaimer: '© 2025 Innovate Inc. All rights reserved. Performance results are not guaranteed.' The disclaimer must be clearly visible at the footer of the document or in the description of a social media post."
+    },
+    "client_type_guidelines": {
+        "content": "Content must be tailored to one of two client types: 'Enterprise' or 'Startup'. Enterprise content should use formal language and focus on scalability and security. Startup content should use more casual language and focus on growth and innovation."
+    },
+    "chart_label_guidelines": {
+        "content": "All charts, graphs, and visual data representations must be fully labeled. This includes: a descriptive title, a label for the X-axis, and a label for the Y-axis. A legend is required if more than one data series is present."
+    },
+    "table_completeness_guidelines": {
+        "content": "Tables used in documentation must be complete. Every row must have a value for every column. If a value is not applicable, use 'N/A'. No cells should be left blank."
+    }
+}
+
+# --- NEW: VECTOR DATABASE SETUP & REAL RETRIEVAL ---
+
+def setup_vector_database():
+    """
+    Sets up a persistent ChromaDB vector database and populates it with the knowledge base.
+    """
+    print("[DB] Setting up vector database with ChromaDB...")
+    # Create a persistent client that saves to disk
+    client = chromadb.PersistentClient(path="./marketing_db")
+    
+    # Use a pre-built sentence-transformer model for creating embeddings
+    # This is a good default model. Others can be used for more specific tasks.
+    sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+
+    # Create a collection (like a table in a relational database)
+    # The embedding_function is passed here.
+    collection = client.get_or_create_collection(
+        name="marketing_guidelines",
+        embedding_function=sentence_transformer_ef
+    )
+
+    # Prepare documents, metadata, and ids for ChromaDB
+    documents = [data["content"] for data in KNOWLEDGE_BASE.values()]
+    ids = list(KNOWLEDGE_BASE.keys())
+
+    # Add the data to the collection.
+    # ChromaDB will automatically handle embedding the documents using the function we provided.
+    # It's idempotent, so running this again with the same IDs won't create duplicates.
+    collection.add(
+        documents=documents,
+        ids=ids
+    )
+    
+    print(f"[DB] Database setup complete. Collection '{collection.name}' contains {collection.count()} items.")
+    return collection
+
+def retrieve_relevant_guidelines(collection, query: str, n_results=4) -> str:
+    """
+    Performs a real semantic search against the ChromaDB collection.
+    """
+    print(f"\n[RAG] Querying vector database for: '{query}'")
+    # Query the collection
+    results = collection.query(
+        query_texts=[query],
+        n_results=n_results
+    )
+    
+    retrieved_docs = results['documents'][0]
+    retrieved_context = "\n\n---\n\n".join(retrieved_docs)
+    print(f"[RAG] Retrieved Context:\n{retrieved_context}")
+    return retrieved_context
+
+
+# --- 2. GENERATION (The "G" in RAG) using Gemini API ---
+# This section remains largely the same, but will now receive context from the real Vector DB.
+
+def get_audit_prompt_template() -> str:
+    """Returns the master prompt template for auditing a single slide."""
+    return """
+    You are a meticulous and highly skilled marketing compliance auditor. Your task is to audit the provided marketing content from a single presentation slide based *only* on the specific guidelines provided to you.
+
+    **Your Persona:**
+    - You are precise and objective.
+    - You reference the guidelines to justify your findings.
+    - You provide constructive feedback for the specific slide you are analyzing.
+
+    **Instructions:**
+    1.  Carefully review the "Retrieved Compliance Guidelines".
+    2.  Analyze the "Marketing Content to Audit" (which may include text, table data, and an image from a single slide).
+    3.  Complete the audit by providing a response in a strict JSON format. Do not add any text or formatting outside of the JSON structure.
+
+    **Retrieved Compliance Guidelines:**
+    ```
+    {retrieved_context}
+    ```
+
+    **Your JSON Output Structure Must Be:**
+    ```json
+    {{
+      "audit_summary": {{
+        "overall_finding": "Compliant", "Non-Compliant", or "Partial-Compliance"
+      }},
+      "checklist": [
+        {{"check_name": "Disclaimer Presence", "finding": "Pass", "Fail", or "N/A"}},
+        {{"check_name": "Client Type Tone", "finding": "Pass", "Fail", or "N/A"}},
+        {{"check_name": "Image/Chart Analysis", "finding": "Pass", "Fail", or "N/A"}},
+        {{"check_name": "Table Completeness", "finding": "Pass", "Fail", or "N/A"}}
+      ],
+      "detailed_feedback": [
+        {{"area": "Disclaimer Presence", "is_compliant": true/false, "comment": "Your analysis for the disclaimer check."}},
+        {{"area": "Client Type Tone", "is_compliant": true/false, "comment": "Your analysis for the client type check."}},
+        {{"area": "Image/Chart Analysis", "is_compliant": true/false, "comment": "Your analysis for the image. If no image was provided, state that."}},
+        {{"area": "Table Completeness", "is_compliant": true/false, "comment": "Your analysis for the table. If no table was provided, state that."}}
+      ]
+    }}
+    ```
+    """
+
+def audit_slide_content(collection, slide_number: int, slide_text: str, slide_images: list):
+    """Orchestrates the RAG pipeline for a single slide's content using the vector DB."""
+    print(f"\n----- Auditing Slide {slide_number} -----")
+    
+    # The query is now more natural. We'll use the slide's text content to find relevant guidelines.
+    query = f"Audit the following content for compliance: {slide_text}"
+    retrieved_context = retrieve_relevant_guidelines(collection, query)
+    
+    if not retrieved_context:
+        print(f"Could not audit slide {slide_number} as no relevant guidelines were found.")
+        return None
+
+    prompt_template = get_audit_prompt_template()
+    prompt = prompt_template.format(retrieved_context=retrieved_context)
+
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    content_to_audit = [f"**Marketing Content for Slide {slide_number}:**\n", slide_text]
+    if slide_images:
+        print(f"[AI] {len(slide_images)} image(s) found on slide {slide_number}. Including in audit.")
+        content_to_audit.extend(slide_images)
+    else:
+        print(f"[AI] No images found on slide {slide_number}.")
+
+    print(f"[AI] Sending request to Gemini API for slide {slide_number}...")
+    
+    try:
+        response = model.generate_content([prompt] + content_to_audit)
+        json_text = response.text.strip().replace("```json", "").replace("```", "")
+        audit_result = json.loads(json_text)
+        return audit_result
+    except Exception as e:
+        print(f"\n--- ERROR on Slide {slide_number} ---")
+        print(f"An error occurred during API call or JSON parsing: {e}")
+        if 'response' in locals():
+            print("Raw response from API:", response.text)
+        return None
+
+# --- 3. PRESENTATION PROCESSING LOGIC ---
+def process_presentation(collection, pptx_path: str):
+    """
+    Opens a .pptx file, extracts content from each slide, and audits it using the provided DB collection.
+    """
+    print(f"=========================================================")
+    print(f"STARTING AUDIT FOR PRESENTATION: {pptx_path}")
+    print(f"=========================================================")
+    
+    try:
+        prs = Presentation(pptx_path)
+    except Exception as e:
+        print(f"Error opening presentation file: {e}")
+        return
+
+    full_audit_report = {}
+
+    for i, slide in enumerate(prs.slides):
+        slide_number = i + 1
+        slide_text_parts = []
+        slide_images = []
+
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                slide_text_parts.append(shape.text_frame.text)
+            
+            if hasattr(shape, 'image'):
+                image = shape.image
+                image_bytes = image.blob
+                pil_image = Image.open(io.BytesIO(image_bytes))
+                slide_images.append(pil_image)
+
+            if shape.has_table:
+                table = shape.table
+                table_md = "\n\n**Table Data:**\n"
+                header = [cell.text for cell in table.rows[0].cells]
+                table_md += f"| {' | '.join(header)} |\n"
+                table_md += f"|{'|'.join(['---'] * len(header))}|\n"
+                for row in list(table.rows)[1:]:
+                    row_data = [cell.text for cell in row.cells]
+                    table_md += f"| {' | '.join(row_data)} |\n"
+                slide_text_parts.append(table_md)
+
+        full_slide_text = "\n".join(slide_text_parts)
+        
+        slide_audit = audit_slide_content(collection, slide_number, full_slide_text, slide_images)
+        if slide_audit:
+            full_audit_report[f"slide_{slide_number}"] = slide_audit
+
+    print("\n\n=========================================================")
+    print("              FULL PRESENTATION AUDIT REPORT             ")
+    print("=========================================================")
+    print(json.dumps(full_audit_report, indent=2))
+    return full_audit_report
+
+# --- 4. EXAMPLE USAGE ---
+def create_dummy_presentation(filename="dummy_presentation.pptx"):
+    """Creates a sample .pptx file for demonstration purposes."""
+    prs = Presentation()
+    
+    slide_1_layout = prs.slide_layouts[5] 
+    slide_1 = prs.slides.add_slide(slide_1_layout)
+    title = slide_1.shapes.title
+    title.text = "Our new tech is awesome for startups!"
+
+    slide_2_layout = prs.slide_layouts[5]
+    slide_2 = prs.slides.add_slide(slide_2_layout)
+    title = slide_2.shapes.title
+    title.text = "Performance Metrics"
+    try:
+        from PIL import ImageDraw
+        img = Image.new('RGB', (400, 250), color = (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([70, 80, 120, 200], fill='cyan')
+        draw.rectangle([170, 120, 220, 200], fill='magenta')
+        img_stream = io.BytesIO()
+        img.save(img_stream, format='PNG')
+        img_stream.seek(0)
+        slide_2.shapes.add_picture(img_stream, Inches(1), Inches(2.0))
+    except ImportError:
+        print("Pillow library not found. Cannot generate image for dummy PPTX.")
+
+    rows, cols = 3, 3
+    table = slide_2.shapes.add_table(rows, cols, Inches(1), Inches(5.0), Inches(6), Inches(0.8)).table
+    table.cell(0, 0).text, table.cell(0, 1).text, table.cell(0, 2).text = 'Feature', 'Our Processor', 'Competitor A'
+    table.cell(1, 0).text, table.cell(1, 1).text, table.cell(1, 2).text = 'Speed', '100 TFlops', '50 TFlops'
+    table.cell(2, 0).text, table.cell(2, 1).text = 'Power', '75W'
+    
+    slide_3_layout = prs.slide_layouts[1]
+    slide_3 = prs.slides.add_slide(slide_3_layout)
+    title = slide_3.shapes.title
+    title.text = "Enterprise Grade Security"
+    body = slide_3.placeholders[1]
+    body.text = "Our platform provides robust security for enterprise clients.\n\n© 2025 Innovate Inc. All rights reserved. Performance results are not guaranteed."
+
+    prs.save(filename)
+    print(f"\nCreated a dummy presentation: {filename}")
+    return filename
+
+if __name__ == "__main__":
+    # 1. Setup the Vector Database from our knowledge base
+    # This will create a "./marketing_db" directory for persistence.
+    db_collection = setup_vector_database()
+    
+    # 2. Create a dummy presentation to audit
+    dummy_pptx_file = create_dummy_presentation()
+    
+    # 3. Process the presentation using the Vector DB for retrieval
+    process_presentation(db_collection, dummy_pptx_file)
