@@ -1,0 +1,276 @@
+Answering your request requires a multi-faceted approach that leverages the power of the Gemini API, particularly its multimodal capabilities, within a Retrieval-Augmented Generation (RAG) framework. Here's a comprehensive breakdown of the best method to achieve your goals, complete with a Python code solution.
+
+## The RAG-Based Approach with Gemini API
+
+A Retrieval-Augmented Generation (RAG) pipeline is an excellent choice here. It allows us to ground the powerful generative capabilities of the Gemini model in the specific information contained within your PowerPoint files. This prevents hallucination and ensures the answers are relevant to your funds.
+
+Here’s the high-level architecture:
+
+1.  **Data Ingestion and Processing:** We'll first need to read your PowerPoint files. Since `.pptx` files are structured documents containing text, images (charts), and tables, we'll extract these elements. Each slide will be treated as a separate document, and its text and visual components will be processed.
+
+2.  **Vectorization and Indexing:** The core of the RAG system is a vector database. We will use a text embedding model to convert the textual content of each slide into a numerical representation (a vector). These vectors will be stored in a vector database (like ChromaDB or FAISS) and indexed by the fund name and slide number. This allows for efficient semantic searching.
+
+3.  **Retrieval:** When you have a query (be it an audit instruction, a search for a specific page, or a question about a fund), we'll first convert that query into a vector. The vector database will then be searched to find the most semantically similar slide vectors.
+
+4.  **Augmentation and Generation with Gemini:** The retrieved text and/or images from the most relevant slides will be passed as context to the Gemini API along with your original prompt. The Gemini model will then use this context to:
+
+      * **Audit:** Analyze the provided text and images for the issues you've specified.
+      * **Identify:** Determine if a slide is a performance page.
+      * **Answer:** Formulate a comprehensive answer to your specific question.
+
+## Python Implementation
+
+Here is a Python script that demonstrates how to implement the three tasks you've outlined.
+
+### Prerequisites
+
+Before you run the code, you need to install the necessary libraries and set up your environment:
+
+1.  **Install Libraries:**
+
+    ```bash
+    pip install google-generativeai python-pptx chromadb Pillow
+    ```
+
+2.  **Set up Gemini API Key:**
+    You'll need a Gemini API key. You can obtain one from Google AI Studio. Once you have your key, set it as an environment variable:
+
+    ```bash
+    export GOOGLE_API_KEY="your_api_key"
+    ```
+
+### Python Code
+
+```python
+import os
+import google.generativeai as genai
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+import chromadb
+from PIL import Image
+import io
+
+# Configure the Gemini API key
+try:
+    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+except KeyError:
+    print("Please set the GOOGLE_API_KEY environment variable.")
+    exit()
+
+class FundDeckAnalyzer:
+    def __init__(self, pptx_files):
+        self.pptx_files = pptx_files
+        self.text_model = "gemini-pro"
+        self.vision_model = "gemini-pro-vision"
+        self.db_client = chromadb.Client()
+        self.collection = self.db_client.get_or_create_collection(name="fund_decks")
+        self._process_files()
+
+    def _extract_text_and_images(self, file_path):
+        prs = Presentation(file_path)
+        slides_data = []
+        for i, slide in enumerate(prs.slides):
+            slide_text = ""
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    slide_text += shape.text + "\n"
+            
+            images = []
+            for shape in slide.shapes:
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE or \
+                   shape.shape_type == MSO_SHAPE_TYPE.CHART or \
+                   hasattr(shape, 'image'):
+                    try:
+                        image_bytes = shape.image.blob
+                        img = Image.open(io.BytesIO(image_bytes))
+                        images.append(img)
+                    except Exception as e:
+                        print(f"Could not extract image from slide {i+1} in {file_path}: {e}")
+
+
+            slides_data.append({"slide_number": i + 1, "text": slide_text, "images": images})
+        return slides_data
+
+    def _process_files(self):
+        documents = []
+        metadatas = []
+        ids = []
+        doc_id = 1
+        for file in self.pptx_files:
+            slides_data = self._extract_text_and_images(file)
+            for slide_data in slides_data:
+                documents.append(slide_data["text"])
+                metadatas.append({"file_name": file, "slide_number": slide_data["slide_number"]})
+                ids.append(f"doc_{doc_id}")
+                doc_id += 1
+        
+        self.collection.add(
+            documents=documents,
+            metadatas=metadatas,
+            ids=ids
+        )
+
+    def audit_presentations(self):
+        audit_results = {}
+        all_files_data = {}
+
+        # First, extract all data
+        for file in self.pptx_files:
+            all_files_data[file] = self._extract_text_and_images(file)
+
+        # Now, audit each file
+        for file_path, slides_data in all_files_data.items():
+            print(f"\n--- Auditing {file_path} ---")
+            
+            # 1. Disclaimer Check (on the whole document's text)
+            full_text = "\n".join([s["text"] for s in slides_data])
+            disclaimer_prompt = "Does the following document contain a disclaimer section? Answer with a simple 'Yes' or 'No'."
+            model = genai.GenerativeModel(self.text_model)
+            response = model.generate_content([disclaimer_prompt, full_text])
+            has_disclaimer = "yes" in response.text.lower()
+            print(f"Disclaimer Present: {has_disclaimer}")
+
+            # 2. Chart and Table Issues
+            vision_model = genai.GenerativeModel(self.vision_model)
+            for slide in slides_data:
+                if slide["images"]:
+                    print(f"  Analysing visuals on slide {slide['slide_number']}...")
+                    prompt = """
+                    Analyze the following image(s) from a financial presentation slide. 
+                    1. For any charts, identify if there are missing titles, axis labels (X and Y), or a legend.
+                    2. For any tables, identify if there are any obvious missing values (like 'N/A', 'TBD', or empty cells) or if the table appears incomplete.
+                    Provide a brief summary of any issues found. If no issues, say 'No issues found'.
+                    """
+                    
+                    try:
+                        response = vision_model.generate_content([prompt] + slide["images"])
+                        if "no issues found" not in response.text.lower():
+                           print(f"    Slide {slide['slide_number']} Visual Issues: {response.text.strip()}")
+                    except Exception as e:
+                        print(f"    Could not analyze visuals on slide {slide['slide_number']}: {e}")
+
+    def find_performance_page(self, file_path):
+        print(f"\n--- Searching for Performance Page in {file_path} ---")
+        query = "A slide showing the fund's historical performance data over the last few years, including annual returns in a chart or table."
+        
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=3,
+            where={"file_name": file_path}
+        )
+
+        if not results['documents']:
+            print("Could not find relevant slides.")
+            return
+
+        # Use Gemini to verify the top results
+        model = genai.GenerativeModel(self.text_model)
+        verification_prompt = "Based on the following text from a slide, is this a fund performance page showing historical returns? Answer 'Yes' or 'No' and provide the slide number."
+        
+        for i, doc in enumerate(results['documents'][0]):
+            metadata = results['metadatas'][0][i]
+            response = model.generate_content([verification_prompt, doc])
+            if "yes" in response.text.lower():
+                print(f"Potential Performance Page Found: Slide {metadata['slide_number']} in {metadata['file_name']}")
+                return metadata['slide_number']
+
+        print("Could not definitively identify a performance page.")
+        return None
+
+    def query_fund_ppt(self, file_path, question):
+        print(f"\n--- Querying {file_path} with: '{question}' ---")
+        
+        # 1. Retrieve relevant context
+        results = self.collection.query(
+            query_texts=[question],
+            n_results=5, # Get top 5 most relevant slides
+            where={"file_name": file_path}
+        )
+        
+        context = "\n".join(results['documents'][0])
+
+        # 2. Generate answer with Gemini
+        prompt = f"""
+        Based *only* on the following context from a presentation, answer the question.
+        
+        Context:
+        {context}
+        
+        Question: {question}
+        
+        Answer:
+        """
+        
+        model = genai.GenerativeModel(self.text_model)
+        response = model.generate_content(prompt)
+        print(response.text)
+
+
+if __name__ == '__main__':
+    # Create dummy PPT files for demonstration
+    # In a real scenario, you would have your actual PPT files in this directory
+    if not os.path.exists("fund_decks"):
+        os.makedirs("fund_decks")
+
+    # This is a placeholder for your actual files
+    # Make sure to place your .pptx files in the 'fund_decks' directory
+    fund_files = [os.path.join("fund_decks", f) for f in os.listdir("fund_decks") if f.endswith(".pptx")]
+    
+    if not fund_files:
+        print("No .pptx files found in the 'fund_decks' directory. Please add your files to run the demo.")
+    else:
+        analyzer = FundDeckAnalyzer(fund_files)
+
+        # --- Task 1: Audit all presentations ---
+        analyzer.audit_presentations()
+
+        # --- Task 2: Identify Performance Page for a specific fund ---
+        # Replace with the actual file path
+        if fund_files:
+             analyzer.find_performance_page(fund_files[0])
+
+        # --- Task 3: Query a specific fund's PPT ---
+        if fund_files:
+            analyzer.query_fund_ppt(
+                fund_files[0], 
+                "What is the investment strategy of this fund?"
+            )
+            analyzer.query_fund_ppt(
+                fund_files[0], 
+                "What are the key risks associated with this fund?"
+            )
+
+```
+
+### How to Use the Code
+
+1.  **Directory Setup:** Create a directory named `fund_decks` in the same location as your Python script. Place all your `.pptx` files in this directory.
+
+2.  **Run the Script:** Execute the Python script from your terminal:
+
+    ```bash
+    python your_script_name.py
+    ```
+
+3.  **Review the Output:** The script will print the results of the audit, the identified performance pages, and the answers to your queries directly to the console.
+
+### Explanation of the Code
+
+  * **`FundDeckAnalyzer` Class:** This class encapsulates all the functionality. It is initialized with a list of your PowerPoint file paths.
+  * **`_extract_text_and_images`:** This private method uses the `python-pptx` library to iterate through each slide of a presentation and extract all textual content and images. It is important to note that this also attempts to extract charts as images.
+  * **`_process_files`:** This method is called during initialization. It processes all the PPT files, extracts the text from each slide, and stores it in the ChromaDB vector database. Each entry is associated with metadata (the original file name and slide number).
+  * **`audit_presentations`:**
+      * It first checks for disclaimers by concatenating all the text from a presentation and asking the Gemini Pro model a direct question.
+      * Then, for each slide containing images, it uses the Gemini Pro Vision model (`gemini-pro-vision`) to analyze the charts and tables for the issues you specified. The multimodal capability is key here.
+  * **`find_performance_page`:**
+      * It takes a file path as input.
+      * It formulates a descriptive query for a "performance page."
+      * It performs a semantic search on the vector database for slides from that specific file that are most similar to the query.
+      * To improve accuracy, it then sends the text of the top candidate slides to the Gemini Pro model to verify if it is indeed a performance page.
+  * **`query_fund_ppt`:**
+      * This is a classic RAG implementation.
+      * It takes a file path and a user question.
+      * It retrieves the most relevant slides from the specified presentation based on the question.
+      * It then passes these retrieved slides as context to the Gemini Pro model along with the original question and instructs the model to answer based only on that context. This ensures that the answers are factual and based on the provided document.
+
+This solution provides a robust and scalable way to manage and extract insights from your fund presentations using the latest in AI technology.
